@@ -1006,6 +1006,12 @@ cdef class BinaryTree:
     cdef np.ndarray node_data_arr
     cdef np.ndarray node_bounds_arr
 
+    # JMG
+    cdef np.ndarray weights_arr
+    cdef DTYPE_t[::1] weights
+    cdef int do_weights
+    ###
+
     cdef readonly DTYPE_t[:, ::1] data
     cdef public ITYPE_t[::1] idx_array
     cdef public NodeData_t[::1] node_data
@@ -1034,6 +1040,11 @@ cdef class BinaryTree:
         self.node_data_arr = np.empty(1, dtype=NodeData, order='C')
         self.node_bounds_arr = np.empty((1, 1, 1), dtype=DTYPE)
 
+        # JMG
+        self.weights_arr = np.empty(1, dtype=DTYPE, order='C')
+        self.weights = get_memview_DTYPE_1D(self.weights_arr)
+        ###
+
         self.data = get_memview_DTYPE_2D(self.data_arr)
         self.idx_array = get_memview_ITYPE_1D(self.idx_array_arr)
         self.node_data = get_memview_NodeData_1D(self.node_data_arr)
@@ -1051,9 +1062,36 @@ cdef class BinaryTree:
         self.n_calls = 0
 
     def __init__(self, data,
-                 leaf_size=40, metric='minkowski', **kwargs):
+                 leaf_size=40, metric='minkowski', weights=None,
+                 **kwargs):
         self.data_arr = np.asarray(data, dtype=DTYPE, order='C')
         self.data = get_memview_DTYPE_2D(self.data_arr)
+
+        print "INIT BINARY_TREE"
+
+        # JMG
+        # Did the user provide weights for each point?
+        # If not we will try to avoid allocating a bunch of unneeded memory.
+        if weights is not None:
+            print "binary_tree weights", weights
+
+            # 'weights' must be 'n_samples' long
+            # I think this check is redundant with call to "check_X_y" in kde.py
+            if len(weights) == self.data.shape[0]:
+                self.weights_arr = np.asarray(weights, dtype=DTYPE, order='C')
+                self.do_weights = 1
+            else:
+                # Give a warning but otherwise ignore
+                print "WARNING: binary_tree.pxi -- len of 'weights' does not match 'data'"
+                self.do_weights = 0
+                self.weights_arr = np.empty(1, dtype=DTYPE, order='C')
+        else:  # user did not provide weights.  Use a single-element array.
+            self.weights_arr = np.empty(1, dtype=DTYPE, order='C')
+            print "binary_tree.pxi: NOT DOING WEIGHTS"
+            self.do_weights = 0
+
+        self.weights = get_memview_DTYPE_1D(self.weights_arr)
+        ###
 
         self.leaf_size = leaf_size
         self.dist_metric = DistanceMetric.get_metric(metric, **kwargs)
@@ -1114,7 +1152,10 @@ cdef class BinaryTree:
                 int(self.n_leaves),
                 int(self.n_splits),
                 int(self.n_calls),
-                self.dist_metric)
+                self.dist_metric,
+### ADDED BY JMG
+                self.weights_arr,
+                self.do_weights)
 
     def __setstate__(self, state):
         """
@@ -1124,6 +1165,18 @@ cdef class BinaryTree:
         self.idx_array_arr = state[1]
         self.node_data_arr = state[2]
         self.node_bounds_arr = state[3]
+
+        # JMG - deal w/ weights
+        if len(state) >= 13:
+            self.weights_arr = state[12]
+            self.do_weights = state[13]
+        else:
+            # Deal w/ no-weights case (backward compatibility)
+            self.weights_arr = np.empty(1, dtype=DTYPE, order='C')
+            self.do_weights = 0
+
+        self.weights = get_memview_DTYPE_1D(self.weights_arr)
+        ###
 
         self.data = get_memview_DTYPE_2D(self.data_arr)
         self.idx_array = get_memview_ITYPE_1D(self.idx_array_arr)
@@ -1152,7 +1205,10 @@ cdef class BinaryTree:
 
     def get_arrays(self):
         return (self.data_arr, self.idx_array_arr,
-                self.node_data_arr, self.node_bounds_arr)
+                self.node_data_arr, self.node_bounds_arr,
+### ADDED BY JMG
+                self.weights_arr
+                )
 
     cdef inline DTYPE_t dist(self, DTYPE_t* x1, DTYPE_t* x2,
                              ITYPE_t size) nogil except -1:
@@ -1557,6 +1613,9 @@ cdef class BinaryTree:
         >>> tree.kernel_density(X[:3], h=0.1, kernel='gaussian')
         array([ 6.94114649,  7.83281226,  7.2071716 ])
         """
+
+        print "HEY binary_tree Kernel Density"
+
         cdef DTYPE_t h_c = h
         cdef DTYPE_t log_atol = log(atol)
         cdef DTYPE_t log_rtol = log(rtol)
@@ -1631,6 +1690,16 @@ cdef class BinaryTree:
                 log_max_bound = (log(n_samples) +
                                  compute_log_kernel(dist_LB,
                                                     h_c, kernel_c))
+
+                # JMG
+                # If we're using weights, we must add the log weights to the bounds.
+                if self.do_weights > 0:
+                    # Here the node weight should just be the sum of all
+                    # weights for all points in the tree.
+                    log_min_bound += log(self._get_node_weight(0))
+                    log_max_bound += log(self._get_node_weight(0))
+                ### 
+
                 log_bound_spread = logsubexp(log_max_bound, log_min_bound)
                 self._kde_single_depthfirst(0, pt, kernel_c, h_c,
                                             log_knorm, log_atol, log_rtol,
@@ -2109,15 +2178,21 @@ cdef class BinaryTree:
         # keep track of the global bounds on density.  The procedure here is
         # to split nodes, updating these bounds, until the bounds are within
         # atol & rtol.
-        cdef ITYPE_t i, i1, i2, N1, N2, i_node
+        cdef ITYPE_t i, i1, i2, i_node  ###, N1, N2
         cdef DTYPE_t global_log_min_bound, global_log_bound_spread
         cdef DTYPE_t global_log_max_bound
 
         cdef DTYPE_t* data = &self.data[0, 0]
         cdef ITYPE_t* idx_array = &self.idx_array[0]
         cdef NodeData_t* node_data = &self.node_data[0]
-        cdef ITYPE_t N = self.data.shape[0]
+### JMG        cdef ITYPE_t N = self.data.shape[0]
         cdef ITYPE_t n_features = self.data.shape[1]
+
+        # JMG
+        cdef DTYPE_t* weights = &self.weights[0]
+        cdef DTYPE_t N1, N2
+        cdef DTYPE_t N = self.data.shape[0]
+        ###
 
         cdef NodeData_t node_info
         cdef DTYPE_t dist_pt, log_density
@@ -2131,6 +2206,13 @@ cdef class BinaryTree:
         nodeheap_item.val = min_dist(self, 0, pt)
         nodeheap_item.i1 = 0
         nodeheap.push(nodeheap_item)
+
+        # JMG
+##        print "BINARY_TREE.pxi running breadthfirst"
+        if self.do_weights > 0:
+            N = self._get_node_weight(0)
+##            print "DOING WEIGHTS"
+        ###
 
         global_log_min_bound = log(N) + compute_log_kernel(max_dist(self,
                                                                     0, pt),
@@ -2149,6 +2231,11 @@ cdef class BinaryTree:
 
             node_info = node_data[i_node]
             N1 = node_info.idx_end - node_info.idx_start
+
+            # JMG
+            if self.do_weights > 0:
+                N1 = self._get_node_weight(i_node)
+            ###
 
             #------------------------------------------------------------
             # Case 1: local bounds are equal to within per-point tolerance.
@@ -2177,6 +2264,13 @@ cdef class BinaryTree:
                     dist_pt = self.dist(pt, data + n_features * idx_array[i],
                                         n_features)
                     log_density = compute_log_kernel(dist_pt, h, kernel)
+
+                    # JMG 
+                    # Account for weight of this point.
+                    if self.do_weights > 0:
+                        log_density += log(weights[idx_array[i]])
+                    ### 
+
                     global_log_min_bound = logaddexp(global_log_min_bound,
                                                      log_density)
 
@@ -2188,6 +2282,12 @@ cdef class BinaryTree:
 
                 N1 = node_data[i1].idx_end - node_data[i1].idx_start
                 N2 = node_data[i2].idx_end - node_data[i2].idx_start
+
+                # JMG
+                if self.do_weights > 0:
+                    N1 = self._get_node_weight(i1)
+                    N2 = self._get_node_weight(i2)
+                ### 
 
                 min_max_dist(self, i1, pt, &dist_LB_1, &dist_UB_1)
                 min_max_dist(self, i2, pt, &dist_LB_2, &dist_UB_2)
@@ -2249,11 +2349,16 @@ cdef class BinaryTree:
         # global_min_bound and global_max_bound give the minimum and maximum
         # density over the entire tree.  We recurse down until global_min_bound
         # and global_max_bound are within rtol and atol.
-        cdef ITYPE_t i, i1, i2, N1, N2
+        cdef ITYPE_t i, i1, i2   ###, N1, N2
 
         cdef DTYPE_t* data = &self.data[0, 0]
         cdef ITYPE_t* idx_array = &self.idx_array[0]
         cdef ITYPE_t n_features = self.data.shape[1]
+        
+        # JMG
+        cdef DTYPE_t* weights = &self.weights[0]
+        cdef DTYPE_t N1, N2
+        ###
 
         cdef NodeData_t node_info = self.node_data[i_node]
         cdef DTYPE_t dist_pt, log_dens_contribution
@@ -2264,6 +2369,14 @@ cdef class BinaryTree:
 
         N1 = node_info.idx_end - node_info.idx_start
         N2 = self.data.shape[0]
+
+        # JMG
+        if self.do_weights > 0:
+            # Faster to store weights when building tree?
+            N1 = self._get_node_weight(i_node)
+            N2 = self._get_node_weight(0)
+        ### 
+
 
         #------------------------------------------------------------
         # Case 1: local bounds are equal to within errors.  Return
@@ -2286,10 +2399,20 @@ cdef class BinaryTree:
                                                 local_log_min_bound)
             global_log_bound_spread[0] = logsubexp(global_log_bound_spread[0],
                                                    local_log_bound_spread)
+
+            ## JMG comment: Loop over points in this node, adding up each one's 
+            # contribution to the density.
             for i in range(node_info.idx_start, node_info.idx_end):
                 dist_pt = self.dist(pt, (data + n_features * idx_array[i]),
                                     n_features)
                 log_dens_contribution = compute_log_kernel(dist_pt, h, kernel)
+
+                # JMG
+                # Account for this point's weight.
+                if self.do_weights > 0:
+                    log_dens_contribution += log(weights[idx_array[i]])
+                ###
+
                 global_log_min_bound[0] = logaddexp(global_log_min_bound[0],
                                                     log_dens_contribution)
 
@@ -2301,6 +2424,14 @@ cdef class BinaryTree:
 
             N1 = self.node_data[i1].idx_end - self.node_data[i1].idx_start
             N2 = self.node_data[i2].idx_end - self.node_data[i2].idx_start
+
+            # JMG
+            if self.do_weights > 0:
+                # This could be faster by storing the total weight of each node
+                # in the tree.  Not sure if this is worth the memory trade off.
+                N1 = self._get_node_weight(i1)
+                N2 = self._get_node_weight(i2)
+            ###
 
             min_max_dist(self, i1, pt, &dist_LB, &dist_UB)
             child1_log_min_bound = log(N1) + compute_log_kernel(dist_UB, h,
@@ -2467,6 +2598,33 @@ cdef class BinaryTree:
                                              r, count, i_min, i_max)
         return 0
 
+    # JMG
+    # NB: Is it faster to just use np.sum()?
+    cdef DTYPE_t _get_node_weight(
+                   self, ITYPE_t i_node) except -1:
+        """Calculate sum of weights of all elements in a node
+        """
+        cdef ITYPE_t* idx_array = &self.idx_array[0]
+        cdef DTYPE_t* weights = &self.weights[0]
+
+        cdef DTYPE_t weightsum
+
+        cdef NodeData_t node_info = self.node_data[i_node]
+        cdef ITYPE_t N, i
+
+        N = node_info.idx_end - node_info.idx_start
+
+        # If there are no weights, then the total weight is
+        # just the number of points in the node.
+        if self.do_weights <= 0:
+            return N
+
+        # Loop over points in this node, adding up their weights.
+        weightsum = 0
+        for i in range(node_info.idx_start, node_info.idx_end):
+            weightsum += (weights[idx_array[i]])
+        return weightsum
+    ###
 
 ######################################################################
 # Python functions for benchmarking and testing C implementations

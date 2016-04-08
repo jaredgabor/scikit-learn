@@ -7,16 +7,20 @@ Kernel Density Estimation
 import numpy as np
 from scipy.special import gammainc
 from ..base import BaseEstimator
-from ..utils import check_array, check_random_state
+from ..utils import check_array, check_random_state, check_X_y
 from ..utils.extmath import row_norms
 from .ball_tree import BallTree, DTYPE
 from .kd_tree import KDTree
 
+# JMG
+from .brute_force_kde import BruteForceKDE
+###
 
 VALID_KERNELS = ['gaussian', 'tophat', 'epanechnikov', 'exponential', 'linear',
                  'cosine']
-TREE_DICT = {'ball_tree': BallTree, 'kd_tree': KDTree}
-
+TREE_DICT = {'ball_tree': BallTree, 'kd_tree': KDTree,
+             ### JMG
+             'brute_force': BruteForceKDE}
 
 # TODO: implement a brute force version for testing purposes
 # TODO: bandwidth estimation
@@ -72,6 +76,9 @@ class KernelDensity(BaseEstimator):
     def __init__(self, bandwidth=1.0, algorithm='auto',
                  kernel='gaussian', metric="euclidean", atol=0, rtol=0,
                  breadth_first=True, leaf_size=40, metric_params=None):
+        print "JMG -- INITIALIZING in kde.py"
+        print "MMMMM"
+
         self.algorithm = algorithm
         self.bandwidth = bandwidth
         self.kernel = kernel
@@ -109,10 +116,15 @@ class KernelDensity(BaseEstimator):
                                  "'{1}'".format(TREE_DICT[algorithm],
                                                 metric))
             return algorithm
+        # JMG
+        elif algorithm in OTHER_ALGORITHMS:
+            return algorithm
+            pass
+        ### 
         else:
             raise ValueError("invalid algorithm: '{0}'".format(algorithm))
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, weights=None):
         """Fit the Kernel Density model on the data.
 
         Parameters
@@ -120,15 +132,23 @@ class KernelDensity(BaseEstimator):
         X : array_like, shape (n_samples, n_features)
             List of n_features-dimensional data points.  Each row
             corresponds to a single data point.
+        weights : array-like, shape (n_samples), optional
+            List of weights corresponding to each data point.
         """
         algorithm = self._choose_algorithm(self.algorithm, self.metric)
         X = check_array(X, order='C', dtype=DTYPE)
+
+        # JMG
+        if weights is not None:
+            X, weights = check_X_y(X, weights, order='C', dtype=DTYPE)
+        ### 
 
         kwargs = self.metric_params
         if kwargs is None:
             kwargs = {}
         self.tree_ = TREE_DICT[algorithm](X, metric=self.metric,
                                           leaf_size=self.leaf_size,
+                                          weights = weights,
                                           **kwargs)
         return self
 
